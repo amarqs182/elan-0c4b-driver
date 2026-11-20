@@ -22,14 +22,15 @@ Stock open-source `libfprint` treats `04f3:0c4b` as an older swipe sensor and fa
   - `0x40 0x24` — `GetBridgeCalibrationMean`
   - `0x40 0x3F` — `SensorWaitFingerPress`
   - `0x40 0x3E` — `SensorWaitFingerRelease` (expects `0xAA`)
+  - `0x00 0x0B` — `SetBridgeCancel` (abort pending sensor wait)
   - `0x00 0x09` — Plain raw 16-bit frame capture (`2 * width * height` bytes on `0x82`)
 
-## Architecture
+## Architecture & Optimizations
 
-- [`src/lib.rs`](src/lib.rs) — `Elan0c4b` USB driver (`rusb`), background subtraction, and PGM image encoding.
-- [`src/matcher.rs`](src/matcher.rs) — Local `9x9` mean subtraction + translation-tolerant Normalized Cross-Correlation (NCC) matcher (`±16 px`, default threshold `0.45`).
-- [`src/main.rs`](src/main.rs) — CLI tool (`info`, `capture`, `capture-cal`, `enroll`, `verify`).
-- [`src/bin/elan-fprintd.rs`](src/bin/elan-fprintd.rs) — System D-Bus daemon implementing `net.reactivated.Fprint.Manager` and `net.reactivated.Fprint.Device` (`/net/reactivated/Fprint/Device/0`), storing templates under `/var/lib/fprint/elan/<user>/<finger>.bin`.
+- [`src/lib.rs`](src/lib.rs) — `Elan0c4b` USB driver (`rusb`), background subtraction, ADC span stats, and 200ms cancellable wait-press/release polling with `SetBridgeCancel` (`0x00 0x0B`).
+- [`src/matcher.rs`](src/matcher.rs) — Fast `O(1)`-per-pixel integral-image (`9x9`) local contrast/variance normalization, foreground variance masking (`MIN_FOREGROUND_RATIO = 0.18`), two-level `40x40 -> 80x80` spatial pyramid NCC, `±12°` rotation search (`0°, ±6°, ±12°`), and early-exit matching (`DEFAULT_MATCH_THRESHOLD = 0.45`).
+- [`src/main.rs`](src/main.rs) — CLI tool (`info`, `capture`, `capture-cal`, `enroll`, `verify`) with 6 quality-checked enrollment samples and match timing/score diagnostics.
+- [`src/bin/elan-fprintd.rs`](src/bin/elan-fprintd.rs) — System D-Bus daemon implementing `net.reactivated.Fprint.Manager` and `net.reactivated.Fprint.Device` (`/net/reactivated/Fprint/Device/0`), featuring startup sensor pre-calibration + cached background (30 min TTL), in-memory `PreparedTemplate` cache, automatic `verify-retry-scan` / `enroll-retry-scan` on weak touches, and configurable `ELAN_MATCH_THRESHOLD` env override (templates stored under `/var/lib/fprint/elan/<user>/<finger>.bin`).
 
 ## Build & Test
 

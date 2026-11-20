@@ -1,13 +1,18 @@
 use elan_0c4b_driver::matcher::{
-    load_templates, save_templates, verify_against_templates, DEFAULT_MATCH_THRESHOLD,
+    load_templates, save_templates, verify_with_details, PreparedTemplate, DEFAULT_MATCH_THRESHOLD,
+    MIN_ADC_DIFF_SPAN,
 };
-use elan_0c4b_driver::{encode_pgm, normalize_u16_to_u8, subtract_background_u8, Elan0c4b};
+use elan_0c4b_driver::{
+    encode_pgm, normalize_u16_to_u8, subtract_background_u8, subtract_background_with_stats,
+    Elan0c4b,
+};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process;
+use std::time::Instant;
 
-const ENROLL_SAMPLES: usize = 5;
+const ENROLL_SAMPLES: usize = 6;
 
 fn print_usage(prog: &str) {
     eprintln!("Usage:");
@@ -25,7 +30,7 @@ fn template_path(finger: &str) -> PathBuf {
         .join(format!("{finger}.bin"))
 }
 
-fn capture_calibrated_frame(dev: &Elan0c4b, width: u16, height: u16, bg: &[u16]) -> Vec<u8> {
+fn capture_calibrated_frame(dev: &Elan0c4b, width: u16, height: u16, bg: &[u16]) -> (Vec<u8>, u16) {
     if let Err(e) = dev.wait_finger_press() {
         eprintln!("Wait finger failed: {e}");
         process::exit(1);
@@ -37,7 +42,7 @@ fn capture_calibrated_frame(dev: &Elan0c4b, width: u16, height: u16, bg: &[u16])
             process::exit(1);
         }
     };
-    subtract_background_u8(&samples, bg)
+    subtract_background_with_stats(&samples, bg)
 }
 
 fn main() {
@@ -87,14 +92,13 @@ fn main() {
 
             let bg = if calibrated {
                 println!("Capturing background calibration frame (keep finger off sensor)...");
-                if let Err(e) = dev.calibration_start() {
-                    eprintln!("Calibration start failed: {e}");
-                    process::exit(1);
-                }
-                Some(dev.capture_raw_u16(info.width, info.height).unwrap_or_else(|e| {
-                    eprintln!("Background capture failed: {e}");
-                    process::exit(1);
-                }))
+                Some(
+                    dev.capture_background(info.width, info.height)
+                        .unwrap_or_else(|e| {
+                            eprintln!("Background capture failed: {e}");
+                            process::exit(1);
+                        }),
+                )
             } else {
                 None
             };
@@ -138,21 +142,39 @@ fn main() {
             });
 
             println!("Calibrating background (keep finger off sensor)...");
-            if let Err(e) = dev.calibration_start() {
-                eprintln!("Calibration start failed: {e}");
-                process::exit(1);
-            }
-            let bg = dev.capture_raw_u16(info.width, info.height).unwrap_or_else(|e| {
-                eprintln!("Background capture failed: {e}");
-                process::exit(1);
-            });
+            let bg = dev
+                .capture_background(info.width, info.height)
+                .unwrap_or_else(|e| {
+                    eprintln!("Background capture failed: {e}");
+                    process::exit(1);
+                });
 
             let mut templates = Vec::with_capacity(ENROLL_SAMPLES);
-            for i in 1..=ENROLL_SAMPLES {
-                println!("[{i}/{ENROLL_SAMPLES}] Touch the sensor with '{finger}'...");
-                let frame = capture_calibrated_frame(&dev, info.width, info.height, &bg);
+            while templates.len() < ENROLL_SAMPLES {
+                println!(
+                    "[{}/{}] Touch the sensor with '{finger}'...",
+                    templates.len() + 1,
+                    ENROLL_SAMPLES
+                );
+                let (frame, span) = capture_calibrated_frame(&dev, info.width, info.height, &bg);
+                let prep = PreparedTemplate::from_pixels(
+                    usize::from(info.width),
+                    usize::from(info.height),
+                    &frame,
+                );
+                if span < MIN_ADC_DIFF_SPAN || !prep.is_good_quality() {
+                    println!(
+                        "  Low-quality touch (span={span}, fg={:.0}%). Lift and touch firmly...",
+                        prep.foreground_ratio * 100.0
+                    );
+                    let _ = dev.wait_finger_release();
+                    continue;
+                }
                 templates.push(frame);
-                println!("  Captured! Lift your finger...");
+                println!(
+                    "  Captured (fg={:.0}%). Lift your finger...",
+                    prep.foreground_ratio * 100.0
+                );
                 let _ = dev.wait_finger_release();
             }
 
@@ -192,27 +214,49 @@ fn main() {
             }
 
             println!("Calibrating background (keep finger off sensor)...");
-            if let Err(e) = dev.calibration_start() {
-                eprintln!("Calibration start failed: {e}");
-                process::exit(1);
-            }
-            let bg = dev.capture_raw_u16(info.width, info.height).unwrap_or_else(|e| {
-                eprintln!("Background capture failed: {e}");
-                process::exit(1);
-            });
+            let bg = dev
+                .capture_background(info.width, info.height)
+                .unwrap_or_else(|e| {
+                    eprintln!("Background capture failed: {e}");
+                    process::exit(1);
+                });
 
             println!("Touch the sensor to verify '{finger}' (threshold {threshold:.2})...");
-            let probe = capture_calibrated_frame(&dev, info.width, info.height, &bg);
-            let score = verify_against_templates(
+            let (probe, span) = capture_calibrated_frame(&dev, info.width, info.height, &bg);
+            let probe_prep = PreparedTemplate::from_pixels(
+                usize::from(info.width),
+                usize::from(info.height),
+                &probe,
+            );
+            let t0 = Instant::now();
+            let res = verify_with_details(
                 usize::from(info.width),
                 usize::from(info.height),
                 &templates,
                 &probe,
             );
-            if score >= threshold {
-                println!("MATCH (score: {score:.3} >= {threshold:.3})");
+            let elapsed_ms = t0.elapsed().as_secs_f32() * 1000.0;
+
+            if res.score >= threshold {
+                println!(
+                    "MATCH (score: {:.3} >= {threshold:.3}, angle: {:.0}deg, shift: ({}, {}), fg: {:.0}%, span: {span}, {:.2}ms)",
+                    res.score,
+                    res.angle_deg,
+                    res.dx,
+                    res.dy,
+                    probe_prep.foreground_ratio * 100.0,
+                    elapsed_ms
+                );
             } else {
-                println!("NO MATCH (score: {score:.3} < {threshold:.3})");
+                println!(
+                    "NO MATCH (score: {:.3} < {threshold:.3}, angle: {:.0}deg, shift: ({}, {}), fg: {:.0}%, span: {span}, {:.2}ms)",
+                    res.score,
+                    res.angle_deg,
+                    res.dx,
+                    res.dy,
+                    probe_prep.foreground_ratio * 100.0,
+                    elapsed_ms
+                );
                 process::exit(1);
             }
         }

@@ -9,7 +9,8 @@ pub mod matcher;
 
 use rusb::{Context, DeviceHandle, UsbContext};
 use std::fmt;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 pub const ELAN_VID: u16 = 0x04f3;
 pub const ELAN_PID: u16 = 0x0c4b;
@@ -21,6 +22,7 @@ pub const EP_IMG_IN: u8 = 0x82;
 pub const CMD_TIMEOUT: Duration = Duration::from_millis(500);
 pub const WAIT_FINGER_TIMEOUT: Duration = Duration::from_secs(15);
 pub const IMG_TIMEOUT: Duration = Duration::from_millis(2000);
+const POLL_SLICE: Duration = Duration::from_millis(200);
 
 #[derive(Debug)]
 pub enum DriverError {
@@ -166,9 +168,55 @@ impl Elan0c4b {
         })
     }
 
+    /// `SetBridgeCancel` (`0x00 0x0B` from `WbfUsbDriver.dll@0x180009F10`),
+    /// then drain any trailing response on `EP_INFO_IN`.
+    pub fn bridge_cancel(&self) -> Result<()> {
+        self.write_cmd(&[0x00, 0x0b])?;
+        let mut drain = [0u8; 64];
+        let _ = self
+            .handle
+            .read_bulk(EP_INFO_IN, &mut drain, Duration::from_millis(50));
+        Ok(())
+    }
+
     /// `SensorWaitFingerPress` (`0x40 0x3F`).
     pub fn wait_finger_press(&self) -> Result<Vec<u8>> {
         self.read_info(&[0x40, 0x3f], 2, WAIT_FINGER_TIMEOUT)
+    }
+
+    /// Poll `SensorWaitFingerPress` (`0x40 0x3F`) in 200ms slices so cancellation
+    /// aborts quickly via `bridge_cancel`.
+    pub fn wait_finger_press_cancellable(
+        &self,
+        cancel: &AtomicBool,
+        max_wait: Duration,
+    ) -> Result<bool> {
+        self.write_cmd(&[0x40, 0x3f])?;
+        let deadline = Instant::now() + max_wait;
+        let mut buf = [0u8; 64];
+
+        loop {
+            if cancel.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                let _ = self.bridge_cancel();
+                return Ok(false);
+            }
+            match self.handle.read_bulk(EP_INFO_IN, &mut buf, POLL_SLICE) {
+                Ok(n) if n > 0 => {
+                    if buf[..n].contains(&0xff) {
+                        return Ok(false);
+                    }
+                    return Ok(true);
+                }
+                Ok(_) => {}
+                Err(rusb::Error::Timeout) => {
+                    if cancel.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                        let _ = self.bridge_cancel();
+                        return Ok(false);
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     /// `SensorWaitFingerRelease` (`0x40 0x3E` -> expects `0xAA` in response).
@@ -181,6 +229,49 @@ impl Elan0c4b {
             cmd: "SensorWaitFingerRelease",
             data: buf,
         })
+    }
+
+    /// Poll `SensorWaitFingerRelease` (`0x40 0x3E`) in 200ms slices so cancellation
+    /// aborts quickly via `bridge_cancel`.
+    pub fn wait_finger_release_cancellable(
+        &self,
+        cancel: &AtomicBool,
+        max_wait: Duration,
+    ) -> Result<bool> {
+        self.write_cmd(&[0x40, 0x3e])?;
+        let deadline = Instant::now() + max_wait;
+        let mut buf = [0u8; 256];
+
+        loop {
+            if cancel.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                let _ = self.bridge_cancel();
+                return Ok(false);
+            }
+            match self.handle.read_bulk(EP_INFO_IN, &mut buf, POLL_SLICE) {
+                Ok(n) if n > 0 => {
+                    if buf[..n].contains(&0xaa) {
+                        return Ok(true);
+                    }
+                    if buf[..n].contains(&0xff) {
+                        return Ok(false);
+                    }
+                }
+                Ok(_) => {}
+                Err(rusb::Error::Timeout) => {
+                    if cancel.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                        let _ = self.bridge_cancel();
+                        return Ok(false);
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Capture a background calibration frame (`calibration_start` + `capture_raw_u16`).
+    pub fn capture_background(&self, width: u16, height: u16) -> Result<Vec<u16>> {
+        self.calibration_start()?;
+        self.capture_raw_u16(width, height)
     }
 
     /// Capture raw 16-bit sensor frame in non-enclave mode (`0x00 0x09` on `EP_CMD_OUT`,
@@ -234,15 +325,37 @@ pub fn decode_dimension(buf: &[u8]) -> Result<u16> {
     Ok(u16::from(buf[0]) + 1)
 }
 
-/// Subtract background frame (`sub_18003C280`: `raw[i].saturating_sub(bg[i])`)
-/// and normalize to 8-bit grayscale.
-pub fn subtract_background_u8(raw: &[u16], background: &[u16]) -> Vec<u8> {
+/// Subtract background frame (`sub_18003C280`: `raw[i].saturating_sub(bg[i])`),
+/// normalize to 8-bit grayscale, and return `(pixels, raw_adc_diff_span)`.
+pub fn subtract_background_with_stats(raw: &[u16], background: &[u16]) -> (Vec<u8>, u16) {
+    let mut min = u16::MAX;
+    let mut max = 0u16;
     let diff: Vec<u16> = raw
         .iter()
         .zip(background.iter())
-        .map(|(&r, &b)| r.saturating_sub(b))
+        .map(|(&r, &b)| {
+            let d = r.saturating_sub(b);
+            if d < min {
+                min = d;
+            }
+            if d > max {
+                max = d;
+            }
+            d
+        })
         .collect();
-    normalize_u16_to_u8(&diff)
+    let span = if diff.is_empty() {
+        0
+    } else {
+        max.saturating_sub(min)
+    };
+    (normalize_u16_to_u8(&diff), span)
+}
+
+/// Subtract background frame (`sub_18003C280`: `raw[i].saturating_sub(bg[i])`)
+/// and normalize to 8-bit grayscale.
+pub fn subtract_background_u8(raw: &[u16], background: &[u16]) -> Vec<u8> {
+    subtract_background_with_stats(raw, background).0
 }
 
 /// Normalize 16-bit sensor samples into an 8-bit grayscale buffer.
@@ -280,7 +393,8 @@ mod tests {
 
     #[test]
     fn subtracts_background_and_encodes_pgm() {
-        let pixels = subtract_background_u8(&[100, 355], &[120, 100]);
+        let (pixels, span) = subtract_background_with_stats(&[100, 355], &[120, 100]);
+        assert_eq!(span, 255);
         assert_eq!(pixels, vec![0, 255]);
         let pgm = encode_pgm(2, 1, &pixels);
         assert!(pgm.starts_with(b"P5\n2 1\n255\n"));
