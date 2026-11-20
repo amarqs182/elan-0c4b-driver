@@ -1,0 +1,11 @@
+[package]
+name = "elan-0c4b-driver"
+version = "0.1.0"
+edition = "2021"
+description = "Native Rust USB driver and fprintd-compatible D-Bus daemon for Elan 04f3:0c4b"
+
+[dependencies]
+libc = "0.2"
+rusb = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+zbus = { version = "4", default-features = false, features = ["tokio"] }

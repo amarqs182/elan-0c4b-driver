@@ -1,0 +1,12 @@
+[Unit]
+Description=Elan 04f3:0c4b Native Rust Fingerprint Authentication Daemon
+After=systemd-udevd.service
+
+[Service]
+Type=dbus
+BusName=net.reactivated.Fprint
+ExecStart=/usr/local/bin/elan-fprintd
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

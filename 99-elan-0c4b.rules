@@ -1,0 +1,2 @@
+# Allow local logged-in user access to Elan 04f3:0c4b fingerprint sensor
+SUBSYSTEM=="usb", ATTR{idVendor}=="04f3", ATTR{idProduct}=="0c4b", MODE="0660", GROUP="wheel", TAG+="uaccess"
