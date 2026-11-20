@@ -6,6 +6,7 @@ use elan_0c4b_driver::matcher::{
     DEFAULT_MATCH_THRESHOLD, MIN_ADC_DIFF_SPAN,
 };
 use elan_0c4b_driver::{subtract_background_with_stats, Elan0c4b, SensorInfo};
+use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::env;
 use std::ffi::CStr;
@@ -17,6 +18,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use zbus::fdo;
 use zbus::message::Header;
+use zbus::names::BusName;
 use zbus::object_server::SignalContext;
 use zbus::zvariant::ObjectPath;
 use zbus::{interface, Connection, DBusError};
@@ -143,12 +145,33 @@ async fn resolve_username(
     uid_to_username(uid).ok_or_else(|| fdo::Error::Failed(format!("unknown uid {uid}")))
 }
 
+async fn sender_is_alive(conn: &Connection, sender: &str) -> bool {
+    let Ok(proxy) = fdo::DBusProxy::new(conn).await else {
+        return false;
+    };
+    let Ok(bus_name) = BusName::try_from(sender) else {
+        return false;
+    };
+    proxy.name_has_owner(bus_name).await.unwrap_or(false)
+}
+
 #[derive(Default)]
 struct DeviceState {
     claimed_by: Option<String>,
+    claimed_sender: Option<String>,
     finger_present: bool,
     finger_needed: bool,
     active_cancel: Option<Arc<AtomicBool>>,
+}
+
+fn release_state(guard: &mut DeviceState) {
+    if let Some(flag) = guard.active_cancel.take() {
+        flag.store(true, Ordering::SeqCst);
+    }
+    guard.finger_needed = false;
+    guard.finger_present = false;
+    guard.claimed_by = None;
+    guard.claimed_sender = None;
 }
 
 struct FprintManager;
@@ -347,18 +370,43 @@ impl FprintDevice {
         let user = resolve_username(&self.conn, &header, username)
             .await
             .map_err(|e| FprintError::Internal(e.to_string()))?;
+        let caller_sender = header.sender().map(|s| s.to_string());
+
+        let existing = {
+            let guard = self.state.lock().unwrap();
+            (guard.claimed_by.is_some(), guard.claimed_sender.clone())
+        };
+
+        if existing.0 {
+            let owner_alive = match existing.1.as_deref() {
+                Some(owner) => sender_is_alive(&self.conn, owner).await,
+                None => false,
+            };
+            if owner_alive {
+                return Err(FprintError::AlreadyInUse("Device already claimed".into()));
+            }
+            eprintln!(
+                "clearing stale claim from disconnected sender {:?}",
+                existing.1
+            );
+            let mut guard = self.state.lock().unwrap();
+            if guard.claimed_sender == existing.1 {
+                release_state(&mut guard);
+            }
+        }
+
         let mut guard = self.state.lock().unwrap();
         if guard.claimed_by.is_some() {
             return Err(FprintError::AlreadyInUse("Device already claimed".into()));
         }
         guard.claimed_by = Some(user);
+        guard.claimed_sender = caller_sender;
         Ok(())
     }
 
     async fn release(&self) -> Result<(), FprintError> {
-        self.cancel_active();
         let mut guard = self.state.lock().unwrap();
-        guard.claimed_by = None;
+        release_state(&mut guard);
         Ok(())
     }
 
@@ -753,7 +801,7 @@ async fn main() -> zbus::Result<()> {
 
     let device = FprintDevice {
         conn: conn.clone(),
-        state,
+        state: state.clone(),
         usb_lock: usb_lock.clone(),
         sensor_cache: sensor_cache.clone(),
         template_cache,
@@ -764,6 +812,30 @@ async fn main() -> zbus::Result<()> {
         .await?;
     conn.object_server().at(DEVICE_PATH, device).await?;
     conn.request_name("net.reactivated.Fprint").await?;
+
+    // Watch D-Bus disconnects so stale claims from crashed/killed clients auto-release.
+    let watch_conn = conn.clone();
+    let watch_state = state;
+    tokio::spawn(async move {
+        if let Ok(proxy) = fdo::DBusProxy::new(&watch_conn).await {
+            if let Ok(mut stream) = proxy.receive_name_owner_changed().await {
+                while let Some(signal) = stream.next().await {
+                    if let Ok(args) = signal.args() {
+                        if args.new_owner.is_none() {
+                            let mut guard = watch_state.lock().unwrap();
+                            if guard.claimed_sender.as_deref() == Some(args.name.as_str()) {
+                                eprintln!(
+                                    "claiming client {} disconnected, auto-releasing device",
+                                    args.name
+                                );
+                                release_state(&mut guard);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     // Pre-calibrate sensor background on startup so first verification is immediate.
     tokio::spawn(async move {
